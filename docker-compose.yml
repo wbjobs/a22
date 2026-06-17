@@ -1,59 +1,31 @@
 services:
-  zookeeper:
-    image: bitnami/zookeeper:3.9
-    container_name: tracing-zookeeper
-    environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
-      - ZOO_TICK_TIME=2000
+  nats:
+    image: nats:2.10-alpine
+    container_name: tracing-nats
     ports:
-      - "2181:2181"
+      - "4222:4222"
+      - "6222:6222"
+      - "8222:8222"
+    command:
+      - "--name"
+      - "tracing-nats"
+      - "--js"
+      - "--sd"
+      - "/data"
+      - "--http_port"
+      - "8222"
+      - "--max_payload"
+      - "8MB"
+      - "--max_connections"
+      - "1024"
     healthcheck:
-      test: ["CMD", "zkServer.sh", "status"]
-      interval: 10s
-      timeout: 10s
-      retries: 3
-    networks:
-      - tracing-net
-
-  kafka:
-    image: bitnami/kafka:3.6
-    container_name: tracing-kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-    ports:
-      - "9092:9092"
-      - "9093:9093"
-    environment:
-      - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
-      - ALLOW_PLAINTEXT_LISTENER=yes
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,INTERNAL://:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,INTERNAL://localhost:9093
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
-      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
-      - KAFKA_CFG_NUM_PARTITIONS=6
-      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
-    healthcheck:
-      test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "localhost:9092"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-    networks:
-      - tracing-net
-
-  kafka-rest-proxy:
-    image: confluentinc/cp-kafka-rest:7.5.0
-    container_name: tracing-kafka-rest
-    depends_on:
-      kafka:
-        condition: service_healthy
-    ports:
-      - "8082:8082"
-    environment:
-      - KAFKA_REST_BOOTSTRAP_SERVERS=kafka:9092
-      - KAFKA_REST_HOST_NAME=kafka-rest-proxy
-      - KAFKA_REST_LISTENERS=http://0.0.0.0:8082
+      test: ["CMD", "sh", "-c", "wget -qO- http://localhost:8222/healthz | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - nats-data:/data
     networks:
       - tracing-net
 
@@ -86,6 +58,7 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 30s
     volumes:
       - es-data:/usr/share/elasticsearch/data
     networks:
@@ -107,21 +80,48 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 45s
     networks:
       - tracing-net
 
-  kafka-topic-init:
-    image: bitnami/kafka:3.6
-    container_name: tracing-kafka-init
+  nats-stream-init:
+    image: natsio/nats-box:0.14.1
+    container_name: tracing-nats-init
     depends_on:
-      kafka:
+      nats:
         condition: service_healthy
     command: >
-      bash -c "
-        echo 'Waiting for Kafka to be ready...' &&
-        sleep 5 &&
-        kafka-topics.sh --create --if-not-exists --topic trace-spans --bootstrap-server kafka:9092 --partitions 6 --replication-factor 1 --config retention.ms=604800000 &&
-        echo 'Topic trace-spans created successfully'
+      sh -c "
+        echo 'Waiting for NATS JetStream...'
+        sleep 3
+        nats --server nats:4222 str add TRACES \
+          --subjects 'trace.spans.>' \
+          --storage file \
+          --replicas 1 \
+          --retention limits \
+          --max-msgs=-1 \
+          --max-bytes=-1 \
+          --max-age 168h \
+          --discard old \
+          --dupe-window 2m \
+          --max-msg-size=-1 \
+          --max-consumers=-1 \
+          --allow-rollup \
+          --deny-delete \
+          --deny-purge \
+          || echo 'Stream may already exist, continuing...'
+        nats --server nats:4222 con add TRACES es-consumer \
+          --filter 'trace.spans.>' \
+          --deliver all \
+          --ack explicit \
+          --ack-wait 30s \
+          --max-deliver 5 \
+          --max-pending 1000 \
+          --replay instant \
+          --pull \
+          || echo 'Consumer may already exist, continuing...'
+        echo 'NATS JetStream initialized'
+        nats --server nats:4222 str ls
       "
     networks:
       - tracing-net
@@ -132,18 +132,25 @@ services:
       dockerfile: docker/Dockerfile.function-a
     container_name: tracing-function-a
     depends_on:
-      kafka-topic-init:
+      nats-stream-init:
         condition: service_completed_successfully
     ports:
       - "8082:8082"
     environment:
       - FUNCTION_A_PORT=8082
       - FUNCTION_B_URL=http://function-b:8083/payment
+      - NATS_URL=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - TRACE_USE_NATS=true
+      - WASM_PLUGIN_DIR=/plugins/wasm
+    volumes:
+      - wasm-plugins:/plugins/wasm
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8082/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     networks:
       - tracing-net
     restart: on-failure
@@ -154,18 +161,22 @@ services:
       dockerfile: docker/Dockerfile.function-b
     container_name: tracing-function-b
     depends_on:
-      kafka-topic-init:
+      nats-stream-init:
         condition: service_completed_successfully
     ports:
       - "8083:8083"
     environment:
       - FUNCTION_B_PORT=8083
       - FUNCTION_C_URL=http://function-c:8084/notify
+      - NATS_URL=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - TRACE_USE_NATS=true
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8083/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     networks:
       - tracing-net
     restart: on-failure
@@ -176,17 +187,21 @@ services:
       dockerfile: docker/Dockerfile.function-c
     container_name: tracing-function-c
     depends_on:
-      kafka-topic-init:
+      nats-stream-init:
         condition: service_completed_successfully
     ports:
       - "8084:8084"
     environment:
       - FUNCTION_C_PORT=8084
+      - NATS_URL=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - TRACE_USE_NATS=true
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8084/health')\""]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
     networks:
       - tracing-net
     restart: on-failure
@@ -210,55 +225,66 @@ services:
       - FUNCTION_A_URL=http://function-a:8082/order
       - FUNCTION_B_URL=http://function-b:8083/payment
       - FUNCTION_C_URL=http://function-c:8084/notify
+      - NATS_URL=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - TRACE_USE_NATS=true
+      - WASM_PLUGIN_DIR=/plugins/wasm
+    volumes:
+      - wasm-plugins:/plugins/wasm
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     networks:
       - tracing-net
     restart: on-failure
 
-  kafka-producer:
+  nats-producer:
     build:
       context: .
-      dockerfile: docker/Dockerfile.kafka-producer
-    container_name: tracing-kafka-producer
+      dockerfile: docker/Dockerfile.nats-producer
+    container_name: tracing-nats-producer
     depends_on:
-      kafka-topic-init:
+      nats-stream-init:
         condition: service_completed_successfully
     ports:
       - "8085:8085"
     environment:
-      - KAFKA_PRODUCER_PORT=8085
-      - KAFKA_BROKERS=kafka:9092
-      - KAFKA_TOPIC=trace-spans
+      - NATS_PRODUCER_PORT=8085
+      - NATS_URLS=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - WASM_PLUGIN_DIR=/plugins/wasm
+    volumes:
+      - wasm-plugins:/plugins/wasm
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8085/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 15s
     networks:
       - tracing-net
     restart: on-failure
 
-  es-consumer:
+  nats-consumer:
     build:
       context: .
-      dockerfile: docker/Dockerfile.es-consumer
-    container_name: tracing-es-consumer
+      dockerfile: docker/Dockerfile.nats-consumer
+    container_name: tracing-nats-consumer
     depends_on:
       elasticsearch:
         condition: service_healthy
-      kafka-topic-init:
+      nats-stream-init:
         condition: service_completed_successfully
     ports:
       - "8086:8086"
     environment:
-      - ES_CONSUMER_PORT=8086
-      - KAFKA_BROKERS=kafka:9092
-      - KAFKA_TOPIC=trace-spans
-      - KAFKA_GROUP_ID=trace-consumer-group-docker
+      - NATS_CONSUMER_PORT=8086
+      - NATS_URLS=nats://nats:4222
+      - NATS_STREAM=TRACES
+      - NATS_CONSUMER=es-consumer
       - ELASTICSEARCH_URL=http://elasticsearch:9200
       - ES_INDEX=trace-spans
     healthcheck:
@@ -304,14 +330,20 @@ services:
     entrypoint: >
       sh -c "
         echo 'Trace Generator started - sending test requests every 5 seconds...'
+        echo 'You can also send custom requests with:'
+        echo '  curl -X POST http://localhost:8080/api/order -H \"Content-Type: application/json\" -d \"{\\\"product_id\\\":\\\"P001\\\",\\\"amount\\\":99.99,\\\"user_id\\\":\\\"U001\\\"}\"'
+        echo ''
         while true; do
-          REQ_ID=$$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo $$RANDOM-$$RANDOM)
-          echo \"[$(date)] Generating trace request: $${REQ_ID}\"
+          REQ_ID=$$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo $$RANDOM-$$RANDOM-$$RANDOM)
+          AMOUNT=$$(( (RANDOM % 900) + 100 )).$$(( RANDOM % 100 ))
+          PRODUCT_ID=PROD-$$RANDOM
+          USER_ID=USER-$$RANDOM
+          echo \"[$(date +%H:%M:%S)] Generating trace: $${REQ_ID} (amount=$$AMOUNT)\"
           curl -s -X POST http://api-gateway:8080/api/order \
             -H 'Content-Type: application/json' \
             -H \"X-Request-ID: $${REQ_ID}\" \
-            -d '{\"product_id\":\"TEST-'$$RANDOM'\",\"amount\":'$$(( (RANDOM % 900) + 100 ))'.'$$(( RANDOM % 100 ))',\"user_id\":\"USER-'$$RANDOM'\"}' \
-            -w ' -> HTTP %{http_code}\\n' || echo 'Request failed'
+            -d \"{\\\"product_id\\\":\\\"$${PRODUCT_ID}\\\",\\\"amount\\\":$$AMOUNT,\\\"user_id\\\":\\\"$${USER_ID}\\\"}\" \
+            -w ' -> HTTP %{http_code}\n' || echo 'Request failed, will retry...'
           sleep 5
         done
       "
@@ -320,7 +352,11 @@ services:
     restart: always
 
 volumes:
+  nats-data:
+    driver: local
   es-data:
+    driver: local
+  wasm-plugins:
     driver: local
 
 networks:

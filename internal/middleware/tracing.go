@@ -2,11 +2,14 @@ package middleware
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +18,9 @@ import (
 	"github.com/google/uuid"
 
 	"ebpf-serverless-tracing/internal/model"
+	"ebpf-serverless-tracing/internal/natsutil"
+	"ebpf-serverless-tracing/internal/sampling"
+	wasmmgr "ebpf-serverless-tracing/internal/wasm"
 )
 
 type responseBodyWriter struct {
@@ -28,11 +34,17 @@ func (r responseBodyWriter) Write(b []byte) (int, error) {
 }
 
 type TracingMiddleware struct {
+	serviceName string
+	natsURL     string
 	producerURL string
 	httpClient  *http.Client
 	mu          sync.Mutex
 	pending     map[string]*pendingSpan
-	serviceName string
+	sampler     *sampling.DynamicSampler
+	wasmMgr     *wasmmgr.WasmPluginManager
+	nats        *natsutil.NATSTraceProducer
+	useNATS     bool
+	stats       MiddlewareStats
 }
 
 type pendingSpan struct {
@@ -40,19 +52,68 @@ type pendingSpan struct {
 	Span      model.TraceSpan
 }
 
+type MiddlewareStats struct {
+	Total         int64
+	Sampled       int64
+	WasmFiltered  int64
+	Published     int64
+	Errors        int64
+	LastRequestID string
+	LastTime      time.Time
+}
+
 func NewTracingMiddleware(serviceName string) *TracingMiddleware {
-	producerURL := os.Getenv("KAFKA_PRODUCER_URL")
-	if producerURL == "" {
-		producerURL = "http://kafka-producer:8085/v1/spans"
+	m := &TracingMiddleware{
+		serviceName: serviceName,
+		producerURL: getEnvOrDefault("TRACE_PRODUCER_URL", "http://nats-producer:8085/v1/spans"),
+		natsURL:     getEnvOrDefault("NATS_URL", "nats://nats:4222"),
+		useNATS:     getEnvOrDefault("TRACE_USE_NATS", "true") == "true",
+		httpClient: &http.Client{
+			Timeout: 3 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConnsPerHost: 16,
+			},
+		},
+		pending: make(map[string]*pendingSpan),
 	}
 
-	m := &TracingMiddleware{
-		producerURL: producerURL,
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
-		pending:     make(map[string]*pendingSpan),
-		serviceName: serviceName,
+	samplingCfg := sampling.SamplingConfig{
+		Strategy:           sampling.StrategyDynamic,
+		BaseSampleRate:     0.01,
+		MinSampleRate:      0.01,
+		MaxSampleRate:      1.0,
+		ErrorRateThreshold: 0.05,
+		SlidingWindow:      1 * time.Minute,
+		AdjustInterval:     5 * time.Second,
+		HighErrorBoost:     10.0,
+		AlwaysSampleError:  true,
+	}
+	m.sampler = sampling.NewDynamicSampler(&samplingCfg)
+
+	wasmDir := os.Getenv("WASM_PLUGIN_DIR")
+	if wasmDir == "" {
+		wasmDir = "./plugins/wasm"
+	}
+	var wasmErr error
+	m.wasmMgr, wasmErr = wasmmgr.NewWasmPluginManager(wasmDir)
+	if wasmErr != nil {
+		log.Printf("[Tracing:%s] Warning: WASM plugin manager unavailable: %v", serviceName, wasmErr)
+	}
+
+	if m.useNATS {
+		natsCfg := &natsutil.NATSConfig{
+			URLs:          strings.Split(m.natsURL, ","),
+			StreamName:    getEnvOrDefault("NATS_STREAM", "TRACES"),
+			SubjectPrefix: "trace.spans",
+		}
+		var natsErr error
+		m.nats, natsErr = natsutil.NewNATSProducer(natsCfg, m.sampler, m.wasmMgr)
+		if natsErr != nil {
+			log.Printf("[Tracing:%s] Warning: NATS producer unavailable (fallback to HTTP): %v", serviceName, natsErr)
+			m.useNATS = false
+		} else {
+			log.Printf("[Tracing:%s] Initialized with NATS direct publishing + dynamic sampling", serviceName)
+		}
 	}
 
 	go m.cleanupLoop()
@@ -98,23 +159,24 @@ func (m *TracingMiddleware) Handler() gin.HandlerFunc {
 		startTime := time.Now()
 
 		pendingKey := requestID + ":" + spanID
-		m.mu.Lock()
-		m.pending[pendingKey] = &pendingSpan{
-			StartTime: startTime,
-			Span: model.TraceSpan{
-				RequestID:    requestID,
-				TraceID:      traceID,
-				SpanID:       spanID,
-				ParentSpanID: parentSpanID,
-				ServiceName:  m.serviceName,
-				FunctionName: m.serviceName,
-				Method:       c.Request.Method,
-				Path:         c.Request.URL.Path,
-				StartTime:    startTime,
-				Protocol:     "HTTP",
-				SourceIP:     getRemoteIP(c),
-			},
+		span := model.TraceSpan{
+			RequestID:    requestID,
+			TraceID:      traceID,
+			SpanID:       spanID,
+			ParentSpanID: parentSpanID,
+			ServiceName:  m.serviceName,
+			FunctionName: m.serviceName,
+			Method:       c.Request.Method,
+			Path:         c.Request.URL.Path,
+			StartTime:    startTime,
+			Protocol:     "HTTP",
+			SourceIP:     getRemoteIP(c),
 		}
+		m.mu.Lock()
+		m.pending[pendingKey] = &pendingSpan{StartTime: startTime, Span: span}
+		m.stats.Total++
+		m.stats.LastRequestID = requestID
+		m.stats.LastTime = time.Now()
 		m.mu.Unlock()
 
 		w := &responseBodyWriter{body: &bytes.Buffer{}, ResponseWriter: c.Writer}
@@ -141,14 +203,61 @@ func (m *TracingMiddleware) Handler() gin.HandlerFunc {
 		pending.Span.DurationMs = duration.Milliseconds()
 		pending.Span.Timestamp = startTime.Add(duration)
 
-		go m.sendSpan(&pending.Span)
+		go m.processAndPublish(&pending.Span)
 
 		log.Printf("[Tracing:%s] request_id=%s span_id=%s method=%s path=%s status=%d duration=%dms",
 			m.serviceName, requestID, spanID, c.Request.Method, c.Request.URL.Path, statusCode, duration.Milliseconds())
 	}
 }
 
-func (m *TracingMiddleware) sendSpan(span *model.TraceSpan) {
+func (m *TracingMiddleware) processAndPublish(span *model.TraceSpan) {
+	if span == nil {
+		return
+	}
+
+	if m.sampler != nil && !m.sampler.ShouldSample(span) {
+		m.mu.Lock()
+		m.stats.Sampled++
+		m.mu.Unlock()
+		return
+	}
+
+	if m.wasmMgr != nil && m.wasmMgr.IsEnabled() {
+		result, errs := m.wasmMgr.RunFilters(span)
+		if len(errs) > 0 {
+			for _, e := range errs {
+				log.Printf("[Tracing:%s] WASM filter error: %v", m.serviceName, e)
+			}
+		}
+		if result != nil && !result.Keep {
+			m.mu.Lock()
+			m.stats.WasmFiltered++
+			m.mu.Unlock()
+			return
+		}
+	}
+
+	if m.useNATS && m.nats != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.nats.PublishSpan(ctx, span); err != nil {
+			m.mu.Lock()
+			m.stats.Errors++
+			m.mu.Unlock()
+			log.Printf("[Tracing:%s] NATS publish error (fallback to HTTP): %v", m.serviceName, err)
+			m.sendSpanHTTP(span)
+		} else {
+			m.mu.Lock()
+			m.stats.Published++
+			m.mu.Unlock()
+		}
+		return
+	}
+
+	m.sendSpanHTTP(span)
+}
+
+func (m *TracingMiddleware) sendSpanHTTP(span *model.TraceSpan) {
 	if m.producerURL == "" || strings.HasPrefix(m.producerURL, "disabled") {
 		return
 	}
@@ -161,16 +270,30 @@ func (m *TracingMiddleware) sendSpan(span *model.TraceSpan) {
 
 	req, err := http.NewRequest("POST", m.producerURL, bytes.NewBuffer(spanJSON))
 	if err != nil {
+		m.mu.Lock()
+		m.stats.Errors++
+		m.mu.Unlock()
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
+		m.mu.Lock()
+		m.stats.Errors++
+		m.mu.Unlock()
 		return
 	}
 	defer resp.Body.Close()
 	io.ReadAll(resp.Body)
+
+	m.mu.Lock()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		m.stats.Published++
+	} else {
+		m.stats.Errors++
+	}
+	m.mu.Unlock()
 }
 
 func (m *TracingMiddleware) cleanupLoop() {
@@ -189,6 +312,32 @@ func (m *TracingMiddleware) cleanupLoop() {
 	}
 }
 
+func (m *TracingMiddleware) Stats() MiddlewareStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stats
+}
+
+func (m *TracingMiddleware) Sampler() *sampling.DynamicSampler {
+	return m.sampler
+}
+
+func (m *TracingMiddleware) WasmManager() *wasmmgr.WasmPluginManager {
+	return m.wasmMgr
+}
+
+func (m *TracingMiddleware) Close() {
+	if m.nats != nil {
+		m.nats.Close()
+	}
+	if m.sampler != nil {
+		m.sampler.Stop()
+	}
+	if m.wasmMgr != nil {
+		m.wasmMgr.Stop()
+	}
+}
+
 func getRemoteIP(c *gin.Context) string {
 	if ip := c.GetHeader("X-Forwarded-For"); ip != "" {
 		ips := strings.Split(ip, ",")
@@ -204,9 +353,68 @@ type TracingRoundTripper struct {
 	Base        http.RoundTripper
 	ServiceName string
 	ProducerURL string
+	NATSURL     string
+	useNATS     bool
+	nats        *natsutil.NATSTraceProducer
+	sampler     *sampling.DynamicSampler
+	wasmMgr     *wasmmgr.WasmPluginManager
+	httpClient  *http.Client
+	initOnce    sync.Once
+	mu          sync.Mutex
+	stats       map[string]int64
+}
+
+func (t *TracingRoundTripper) init() {
+	t.initOnce.Do(func() {
+		if t.httpClient == nil {
+			t.httpClient = &http.Client{
+				Timeout: 5 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConnsPerHost: 16,
+				},
+			}
+		}
+
+		t.stats = make(map[string]int64)
+
+		samplingCfg := sampling.SamplingConfig{
+			Strategy:           sampling.StrategyDynamic,
+			BaseSampleRate:     0.01,
+			MinSampleRate:      0.01,
+			MaxSampleRate:      1.0,
+			ErrorRateThreshold: 0.05,
+			AlwaysSampleError:  true,
+		}
+		t.sampler = sampling.NewDynamicSampler(&samplingCfg)
+
+		natsURL := t.NATSURL
+		if natsURL == "" {
+			natsURL = os.Getenv("NATS_URL")
+			if natsURL == "" {
+				natsURL = "nats://nats:4222"
+			}
+		}
+
+		t.useNATS = getEnvOrDefault("TRACE_USE_NATS", "true") == "true"
+		if t.useNATS {
+			natsCfg := &natsutil.NATSConfig{
+				URLs:          strings.Split(natsURL, ","),
+				StreamName:    getEnvOrDefault("NATS_STREAM", "TRACES"),
+				SubjectPrefix: "trace.spans",
+			}
+			var err error
+			t.nats, err = natsutil.NewNATSProducer(natsCfg, t.sampler, t.wasmMgr)
+			if err != nil {
+				log.Printf("[TracingRT:%s] Warning: NATS unavailable: %v", t.ServiceName, err)
+				t.useNATS = false
+			}
+		}
+	})
 }
 
 func (t *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.init()
+
 	requestID := req.Header.Get("X-Request-ID")
 	traceID := req.Header.Get("X-Trace-ID")
 	parentSpanID := req.Header.Get("X-Parent-Span-ID")
@@ -230,14 +438,6 @@ func (t *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	req.Header.Set("X-Parent-Span-ID", parentSpanID)
 	req.Header.Set("X-Service-Name", t.ServiceName)
 	req.Header.Set("X-Function-Name", t.ServiceName)
-
-	producerURL := t.ProducerURL
-	if producerURL == "" {
-		producerURL = os.Getenv("KAFKA_PRODUCER_URL")
-		if producerURL == "" {
-			producerURL = "http://kafka-producer:8085/v1/spans"
-		}
-	}
 
 	startTime := time.Now()
 	destIP, destPort := parseHostPort(req.URL.Host)
@@ -271,18 +471,64 @@ func (t *TracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 
 	if err != nil {
 		span.StatusCode = 0
-		go sendSpanToProducer(producerURL, &span)
-		return resp, err
+	} else {
+		span.StatusCode = resp.StatusCode
 	}
 
-	span.StatusCode = resp.StatusCode
-	go sendSpanToProducer(producerURL, &span)
+	go t.publishSpan(&span)
 
 	return resp, err
 }
 
-func sendSpanToProducer(url string, span *model.TraceSpan) {
-	if url == "" || strings.HasPrefix(url, "disabled") {
+func (t *TracingRoundTripper) publishSpan(span *model.TraceSpan) {
+	if span == nil {
+		return
+	}
+
+	if t.sampler != nil && !t.sampler.ShouldSample(span) {
+		t.mu.Lock()
+		t.stats["sampled"]++
+		t.mu.Unlock()
+		return
+	}
+
+	if t.wasmMgr != nil && t.wasmMgr.IsEnabled() {
+		result, _ := t.wasmMgr.RunFilters(span)
+		if result != nil && !result.Keep {
+			t.mu.Lock()
+			t.stats["wasm_filtered"]++
+			t.mu.Unlock()
+			return
+		}
+	}
+
+	if t.useNATS && t.nats != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := t.nats.PublishSpan(ctx, span); err != nil {
+			t.mu.Lock()
+			t.stats["errors"]++
+			t.mu.Unlock()
+		} else {
+			t.mu.Lock()
+			t.stats["published"]++
+			t.mu.Unlock()
+			return
+		}
+	}
+
+	t.sendHTTPFallback(span)
+}
+
+func (t *TracingRoundTripper) sendHTTPFallback(span *model.TraceSpan) {
+	producerURL := t.ProducerURL
+	if producerURL == "" {
+		producerURL = os.Getenv("TRACE_PRODUCER_URL")
+		if producerURL == "" {
+			producerURL = "http://nats-producer:8085/v1/spans"
+		}
+	}
+	if producerURL == "" || strings.HasPrefix(producerURL, "disabled") {
 		return
 	}
 
@@ -291,13 +537,16 @@ func sendSpanToProducer(url string, span *model.TraceSpan) {
 		return
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(spanJSON))
+	req, err := http.NewRequest("POST", producerURL, bytes.NewBuffer(spanJSON))
 	if err != nil {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := t.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return
@@ -322,9 +571,7 @@ func parseHostPort(hostport string) (string, uint16) {
 	case "443":
 		port = 443
 	default:
-		var p int
-		_, err := sscanf(portStr, "%d", &p)
-		if err == nil && p > 0 && p < 65536 {
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p < 65536 {
 			port = uint16(p)
 		}
 	}
@@ -338,6 +585,11 @@ func parseHostPort(hostport string) (string, uint16) {
 	return host, port
 }
 
-func sscanf(s, format string, args ...interface{}) (int, error) {
-	return 0, nil
+func getEnvOrDefault(key, defaultValue string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return defaultValue
 }
+
+var _ = fmt.Sprintf

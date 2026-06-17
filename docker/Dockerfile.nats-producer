@@ -1,0 +1,52 @@
+FROM golang:1.21-bullseye AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    xz-utils \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://github.com/bytecodealliance/wasmtime/releases/download/v20.0.0/wasmtime-v20.0.0-x86_64-linux-c-api.tar.xz -o /tmp/wasmtime.tar.xz \
+    && mkdir -p /opt/wasmtime \
+    && tar -xf /tmp/wasmtime.tar.xz -C /opt/wasmtime --strip-components=1 \
+    && cp /opt/wasmtime/lib/libwasmtime.so /usr/lib/ \
+    && cp -r /opt/wasmtime/include/* /usr/include/ \
+    && ldconfig \
+    && rm -f /tmp/wasmtime.tar.xz
+
+ENV CGO_ENABLED=1
+ENV CGO_LDFLAGS="-lwasmtime"
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download || true
+
+COPY . .
+
+RUN mkdir -p bin && \
+    go build -ldflags="-s -w" -o bin/nats-producer ./cmd/nats-producer
+
+FROM debian:bullseye-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/lib/libwasmtime.so* /usr/lib/
+RUN ldconfig
+
+COPY --from=builder /app/bin/nats-producer /usr/local/bin/nats-producer
+
+RUN mkdir -p /plugins/wasm
+
+ENV WASM_PLUGIN_DIR=/plugins/wasm
+
+EXPOSE 8085
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:8085/health || exit 1
+
+ENTRYPOINT ["nats-producer"]

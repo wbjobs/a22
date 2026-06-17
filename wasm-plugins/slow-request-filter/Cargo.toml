@@ -1,0 +1,29 @@
+[package]
+name = "slow-request-filter"
+version = "0.1.0"
+authors = ["Tracing Team"]
+edition = "2021"
+description = "WASM filter that only keeps slow requests (> configurable threshold)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+
+[dependencies.wasm-bindgen]
+version = "0.2"
+optional = true
+
+[features]
+default = []
+bindgen = ["wasm-bindgen"]
