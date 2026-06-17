@@ -7,6 +7,8 @@ NATS_PRODUCER_IMG := ebpf-serverless/nats-producer
 NATS_CONSUMER_IMG := ebpf-serverless/nats-consumer
 QUERY_API_IMG := ebpf-serverless/query-api
 EBPF_PROBE_IMG := ebpf-serverless/ebpf-probe
+CHAOS_MANAGER_IMG := ebpf-serverless/chaos-manager
+AI_PREDICTOR_IMG := ebpf-serverless/ai-predictor
 
 GO_CMD ?= go
 DOCKER_CMD ?= docker
@@ -16,7 +18,10 @@ KUBECTL ?= kubectl
 .PHONY: help build build-go docker-build docker-build-all docker-push k8s-deploy k8s-delete \
         compose-up compose-down compose-logs clean test verify ebpf-generate \
         wasm-build wasm-build-rust sampling-stats wasm-list wasm-upload \
-        nats-streams nats-consumers
+        nats-streams nats-consumers \
+        ai-predictions ai-predict ai-send-alert \
+        chaos-stats chaos-inject-latency chaos-inject-error chaos-clear chaos-list \
+        topology health-overview health-service
 
 help:
 	@echo "===== Build ====="
@@ -46,6 +51,24 @@ help:
 	@echo "  make nats-consumers       - List JetStream consumers"
 	@echo "  make nats-report          - Show NATS traffic report"
 	@echo ""
+	@echo "===== AI Fault Prediction ====="
+	@echo "  make ai-predictions       - View all AI predictions"
+	@echo "  make ai-predict SVC=xxx   - Predict timeout for specific service"
+	@echo "  make ai-send-alert        - Send test alert to DingTalk/Feishu"
+	@echo ""
+	@echo "===== Chaos Engineering ====="
+	@echo "  make chaos-stats          - View chaos injection stats"
+	@echo "  make chaos-list           - List active chaos rules"
+	@echo "  make chaos-inject-latency SVC=function-a MS=500 - Inject latency"
+	@echo "  make chaos-inject-error SVC=function-a CODE=500 - Inject error"
+	@echo "  make chaos-clear          - Clear all chaos rules"
+	@echo ""
+	@echo "===== Topology & Health ====="
+	@echo "  make topology             - View service topology data"
+	@echo "  make topology-ui          - Open topology visualization in browser"
+	@echo "  make health-overview      - View overall health status"
+	@echo "  make health-service SVC=xxx - View specific service health"
+	@echo ""
 	@echo "===== Testing ====="
 	@echo "  make test                 - Run Go tests"
 	@echo "  make test-request         - Send test order request"
@@ -56,7 +79,7 @@ help:
 	@echo "  make k8s-deploy           - Deploy to K8s"
 	@echo "  make k8s-delete           - Delete all K8s resources"
 
-build: build-gateway build-function-a build-nats-producer build-nats-consumer build-query-api build-ebpf-probe
+build: build-gateway build-function-a build-nats-producer build-nats-consumer build-query-api build-ebpf-probe build-chaos-manager
 
 build-gateway:
 	@echo "Building API Gateway..."
@@ -88,6 +111,11 @@ build-ebpf-probe: ebpf-generate
 	@mkdir -p bin
 	CGO_ENABLED=0 $(GO_CMD) build -ldflags="-s -w" -o bin/ebpf-probe ./cmd/ebpf-probe
 
+build-chaos-manager:
+	@echo "Building Chaos Engineering Manager..."
+	@mkdir -p bin
+	CGO_ENABLED=0 $(GO_CMD) build -ldflags="-s -w" -o bin/chaos-manager ./cmd/chaos-manager
+
 ebpf-generate:
 	@echo "Generating eBPF bindings..."
 	cd cmd/ebpf-probe && $(GO_CMD) generate ./... 2>/dev/null || echo "eBPF generation skipped (requires clang+bpf2go)"
@@ -104,7 +132,8 @@ wasm-build-rust:
 
 docker-build-all: docker-build-gateway docker-build-function-a docker-build-function-b \
                   docker-build-function-c docker-build-nats-producer \
-                  docker-build-nats-consumer docker-build-query-api docker-build-ebpf-probe
+                  docker-build-nats-consumer docker-build-query-api docker-build-ebpf-probe \
+                  docker-build-chaos-manager docker-build-ai-predictor
 
 docker-build-gateway:
 	$(DOCKER_CMD) build -t $(GATEWAY_IMG):latest -f docker/Dockerfile.gateway .
@@ -130,6 +159,12 @@ docker-build-query-api:
 docker-build-ebpf-probe:
 	$(DOCKER_CMD) build -t $(EBPF_PROBE_IMG):latest -f docker/Dockerfile.ebpf-probe .
 
+docker-build-chaos-manager:
+	$(DOCKER_CMD) build -t $(CHAOS_MANAGER_IMG):latest -f docker/Dockerfile.chaos-manager .
+
+docker-build-ai-predictor:
+	$(DOCKER_CMD) build -t $(AI_PREDICTOR_IMG):latest -f docker/Dockerfile.ai-predictor .
+
 docker-push:
 	$(DOCKER_CMD) push $(GATEWAY_IMG):latest
 	$(DOCKER_CMD) push $(FUNCTION_A_IMG):latest
@@ -141,16 +176,25 @@ docker-push:
 	$(DOCKER_CMD) push $(EBPF_PROBE_IMG):latest
 
 compose-up:
-	@echo "Starting full stack with NATS + JetStream + Dynamic Sampling + WASM..."
+	@echo "Starting full stack with NATS + JetStream + Dynamic Sampling + WASM + AI Prediction + Chaos Engineering..."
 	$(DOCKER_COMPOSE) up -d --build
 	@echo ""
-	@echo "Wait ~60s for all services to initialize, then:"
-	@echo "  Gateway:     http://localhost:8080"
-	@echo "  Query API:   http://localhost:8081"
-	@echo "  Producer:    http://localhost:8085 (sampling + WASM admin)"
-	@echo "  Consumer:    http://localhost:8086"
-	@echo "  Kibana:      http://localhost:5601"
-	@echo "  NATS UI:     http://localhost:8222"
+	@echo "Wait ~90s for all services to initialize, then:"
+	@echo "  Gateway:       http://localhost:8080"
+	@echo "  Query API:     http://localhost:8081"
+	@echo "  Topology UI:   http://localhost:8081/web/topology.html"
+	@echo "  Producer:      http://localhost:8085 (sampling + WASM admin)"
+	@echo "  Consumer:      http://localhost:8086"
+	@echo "  AI Predictor:  http://localhost:8087 (LSTM fault prediction)"
+	@echo "  Chaos Manager: http://localhost:8088 (chaos injection admin)"
+	@echo "  Kibana:        http://localhost:5601"
+	@echo "  NATS UI:       http://localhost:8222"
+	@echo ""
+	@echo "Quick commands:"
+	@echo "  make topology-ui          - Open topology visualization"
+	@echo "  make ai-predictions       - View AI fault predictions"
+	@echo "  make chaos-inject-latency SVC=function-a MS=500 - Inject latency"
+	@echo "  make health-overview      - View health overview"
 	@echo ""
 	@echo "Run 'make compose-logs' to view logs"
 
@@ -295,6 +339,76 @@ test-stats:
 test-services:
 	@echo "Tracked services..."
 	@curl -s http://localhost:8081/api/services | python -m json.tool 2>/dev/null || cat
+
+# ===== AI Fault Prediction =====
+
+ai-predictions:
+	@echo "===== AI Fault Predictions ====="
+	@curl -s http://localhost:8087/api/predictions | python -m json.tool 2>/dev/null || curl -s http://localhost:8087/api/predictions
+
+ai-predict:
+	@if [ -z "$(SVC)" ]; then echo "Usage: make ai-predict SVC=function-a"; exit 1; fi
+	@echo "Predicting timeout risk for service: $(SVC)"
+	@curl -s http://localhost:8087/api/predictions/$(SVC) | python -m json.tool 2>/dev/null || cat
+
+ai-send-alert:
+	@echo "Sending test alert..."
+	@curl -s -X POST http://localhost:8087/api/alert \
+		-H "Content-Type: application/json" \
+		-d '{"service":"test-service","confidence":0.85,"avg_latency":1500,"error_rate":0.08,"details":"Test alert from make command"}' | python -m json.tool 2>/dev/null || cat
+
+# ===== Chaos Engineering =====
+
+chaos-stats:
+	@echo "===== Chaos Engineering Stats ====="
+	@curl -s http://localhost:8088/api/stats | python -m json.tool 2>/dev/null || curl -s http://localhost:8088/api/stats
+	@echo ""
+	@echo "===== Available Services ====="
+	@curl -s http://localhost:8088/api/services | python -m json.tool 2>/dev/null || curl -s http://localhost:8088/api/services
+
+chaos-list:
+	@echo "===== Active Chaos Rules ====="
+	@curl -s http://localhost:8088/api/rules | python -m json.tool 2>/dev/null || curl -s http://localhost:8088/api/rules
+
+chaos-inject-latency:
+	@if [ -z "$(SVC)" ] || [ -z "$(MS)" ]; then echo "Usage: make chaos-inject-latency SVC=function-a MS=500 [DURATION=300] [PROB=1.0]"; exit 1; fi
+	@echo "Injecting latency $(MS)ms to $(SVC)..."
+	@curl -s -X POST http://localhost:8088/api/inject/latency \
+		-H "Content-Type: application/json" \
+		-d "{\"service\":\"$(SVC)\",\"ms\":$(MS),\"duration_sec\":$(or $(DURATION),300),\"prob\":$(or $(PROB),1.0),\"reason\":\"Manual test from CLI\"}" | python -m json.tool 2>/dev/null || cat
+
+chaos-inject-error:
+	@if [ -z "$(SVC)" ]; then echo "Usage: make chaos-inject-error SVC=function-a [CODE=500] [DURATION=300] [PROB=1.0]"; exit 1; fi
+	@echo "Injecting error $(or $(CODE),500) to $(SVC)..."
+	@curl -s -X POST http://localhost:8088/api/inject/error \
+		-H "Content-Type: application/json" \
+		-d "{\"service\":\"$(SVC)\",\"status_code\":$(or $(CODE),500),\"duration_sec\":$(or $(DURATION),300),\"prob\":$(or $(PROB),1.0),\"reason\":\"Manual test from CLI\"}" | python -m json.tool 2>/dev/null || cat
+
+chaos-clear:
+	@echo "Clearing ALL chaos rules..."
+	@curl -s -X POST http://localhost:8088/api/clear | python -m json.tool 2>/dev/null || cat
+
+# ===== Topology & Health =====
+
+topology:
+	@echo "===== Service Topology ====="
+	@curl -s http://localhost:8081/api/topology | python -m json.tool 2>/dev/null || curl -s http://localhost:8081/api/topology
+
+topology-ui:
+	@echo "Opening topology visualization..."
+	@echo "Please open in browser: http://localhost:8081/web/topology.html"
+	-@start http://localhost:8081/web/topology.html 2>/dev/null || \
+		xdg-open http://localhost:8081/web/topology.html 2>/dev/null || \
+		open http://localhost:8081/web/topology.html 2>/dev/null || true
+
+health-overview:
+	@echo "===== Overall Health Overview ====="
+	@curl -s http://localhost:8081/api/health/overview | python -m json.tool 2>/dev/null || curl -s http://localhost:8081/api/health/overview
+
+health-service:
+	@if [ -z "$(SVC)" ]; then echo "Usage: make health-service SVC=function-a"; exit 1; fi
+	@echo "===== Health Status: $(SVC) ====="
+	@curl -s http://localhost:8081/api/health/$(SVC) | python -m json.tool 2>/dev/null || cat
 
 clean:
 	@echo "Cleaning build artifacts..."

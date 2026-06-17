@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 import requests
+import chaos as chaos_engine
 
 app = Flask(__name__)
 
@@ -21,6 +22,16 @@ FUNCTION_A_URL = os.environ.get('FUNCTION_A_URL', 'http://function-a:8082')
 FUNCTION_B_URL = os.environ.get('FUNCTION_B_URL', 'http://function-b:8083')
 FUNCTION_C_URL = os.environ.get('FUNCTION_C_URL', 'http://function-c:8084')
 PORT = int(os.environ.get('FUNCTION_C_PORT', 8084))
+
+chaos_engine.register_admin_routes(app)
+
+
+@app.before_request
+def chaos_before_request():
+    mw = chaos_engine.middleware()
+    result = mw()
+    if result is not None:
+        return result
 
 
 @app.before_request

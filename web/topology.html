@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Serverless Tracing - 服务拓扑</title>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+.container { display: flex; height: 100vh; flex-direction: column; }
+.header { padding: 16px 24px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+.header h1 { font-size: 1.25rem; font-weight: 600; }
+.header .controls { display: flex; gap: 16px; align-items: center; gap: 12px; }
+select, button {
+  background: #334155; color: #e2e8f0; border: 1px solid #475569; padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer;
+}
+button:hover { background: #475569; }
+.main { flex: 1; display: flex; }
+.sidebar { width: 320px; background: #1e293b; border-right: 1px solid #334155; padding: 16px; overflow-y: auto; }
+.sidebar h2 { font-size: 1rem; margin-bottom: 12px; color: #94a3b8; }
+.legend { margin-bottom: 24px; }
+.legend-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+.legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+.status-healthy { background: #22c55e; }
+.status-degraded { background: #eab308; }
+.status-warning { background: #f97316; }
+.status-critical { background: #ef4444; }
+.status-unknown { background: #64748b; }
+.service-card { background: #334155; border-radius: 8px; padding: 12px; margin-bottom: 8px; border-left: 4px solid #64748b; }
+.service-card.healthy { border-left-color: #22c55e; }
+.service-card.degraded { border-left-color: #eab308; }
+.service-card.warning { border-left-color: #f97316; }
+.service-card.critical { border-left-color: #ef4444; }
+.service-card h3 { font-size: 14px; margin-bottom: 4px; }
+.service-card .score { font-size: 24px; font-weight: 700; }
+.service-card .metrics { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+#topology { flex: 1; background: #0f172a; }
+.overview { display: flex; gap: 16px; margin-bottom: 16px; }
+.overview-card { flex: 1; background: #334155; padding: 12px; border-radius: 8px; text-align: center; }
+.overview-card .label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.overview-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+.predictions-section { margin-top: 16px; }
+.prediction-card { background: #334155; padding: 10px; border-radius: 8px; margin-bottom: 8px; border-left: 3px solid; }
+.prediction-card.ok { border-left-color: #22c55e; }
+.prediction-card.risk { border-left-color: #ef4444; }
+.prediction-card.warn { border-left-color: #f97316; }
+.prediction-card h4 { font-size: 13px; margin-bottom: 4px; }
+.prediction-card .prob { font-weight: 600; }
+.prediction-card .details { font-size: 11px; color: #94a3b8; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>🔍 分布式链路追踪 - 服务拓扑</h1>
+    <div class="controls">
+      <select id="timeRange">
+        <option value="1">最近 1 小时</option>
+        <option value="6">最近 6 小时</option>
+        <option value="24">最近 24 小时</option>
+      </select>
+      <button onclick="refreshData()">🔄 刷新</button>
+      <button onclick="togglePredictions()">🤖 AI 预测</button>
+    </div>
+  </div>
+  <div class="main">
+    <div class="sidebar">
+      <h2>📊 总览</h2>
+      <div class="overview">
+        <div class="overview-card">
+          <div class="label">整体状态</div>
+          <div class="value" id="overallStatus">加载中</div>
+        </div>
+        <div class="overview-card">
+          <div class="label">整体分数</div>
+          <div class="value" id="overallScore">-</div>
+        </div>
+        <div class="overview-card">
+          <div class="label">服务数</div>
+          <div class="value" id="serviceCount">0</div>
+        </div>
+      </div>
+      <div class="overview">
+        <div class="overview-card">
+          <div class="label">总请求</div>
+          <div class="value" id="totalReq">0</div>
+        </div>
+        <div class="overview-card">
+          <div class="label">错误数</div>
+          <div class="value" id="totalErr">0</div>
+        </div>
+        <div class="overview-card">
+          <div class="label">严重服务</div>
+          <div class="value" id="criticalCount">0</div>
+        </div>
+      </div>
+      <h2 style="margin-top: 20px;">🏷️ 图例</h2>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-dot status-healthy"></span> 健康 (90-100)</div>
+        <div class="legend-item"><span class="legend-dot status-degraded"></span> 降级 (75-89)</div>
+        <div class="legend-item"><span class="legend-dot status-warning"></span> 警告 (50-74)</div>
+        <div class="legend-item"><span class="legend-dot status-critical"></span> 严重 (0-49)</div>
+        <div class="legend-item"><span class="legend-dot status-unknown"></span> 未知</div>
+      </div>
+      <h2>🩺 服务健康</h2>
+      <div id="serviceList"></div>
+      <div class="predictions-section">
+        <h2>🤖 AI 故障预测</h2>
+        <div id="predictionList"></div>
+      </div>
+    </div>
+    <div id="topology"></div>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin || 'http://localhost:8081';
+let cy = null;
+
+function healthColor(status) {
+  switch(status) {
+    case 'healthy': return '#22c55e';
+    case 'degraded': return '#eab308';
+    case 'warning': return '#f97316';
+    case 'critical': return '#ef4444';
+    default: return '#64748b';
+  }
+}
+
+function initCytoscape() {
+  cy = cytoscape({
+    container: document.getElementById('topology'),
+    style: [
+      {
+        selector: 'node',
+        style: {
+          'background-color': '#64748b',
+          'label': 'data(name)',
+          'color': '#fff',
+          'text-valign': 'center',
+          'text-halign': 'center',
+          'font-size': 14,
+          'font-weight': 'bold',
+          'width': 80,
+          'height': 80,
+          'border-width': 3,
+          'border-color': '#475569,
+          'text-outline-width': 2,
+          'text-outline-color': '#1e293b'
+        }
+      },
+      {
+        selector: 'node[status = "healthy"]', style: { 'background-color': '#22c55e', 'border-color': '#16a34a' }
+      },
+      {
+        selector: 'node[status = "degraded"]', style: { 'background-color': '#eab308', 'border-color': '#ca8a04' }
+      },
+      {
+        selector: 'node[status = "warning"]', style: { 'background-color': '#f97316', 'border-color': '#ea580c' }
+      },
+      {
+        selector: 'node[status = "critical"]', style: {
+          'background-color': '#ef4444',
+          'border-color': '#dc2626',
+          'border-width': 5
+        }
+      },
+      {
+        selector: 'edge',
+        style: {
+          'width': 2,
+          'line-color': '#475569',
+          'target-arrow-color': '#94a3b8',
+          'target-arrow-shape': 'triangle',
+          'curve-style': 'bezier',
+          'label': 'data(call_count)',
+          'font-size': 10,
+          'color': '#94a3b8',
+          'text-rotation': 'autorotate',
+          'text-margin-y': -10
+        }
+      },
+      {
+        selector: 'node:selected', style: {
+          'border-width': 6,
+          'border-color': '#3b82f6'
+        }
+      }
+    ],
+    layout: {
+      name: 'breadthfirst',
+      directed: true,
+      padding: 50,
+      spacingFactor: 1.5
+    },
+    wheelSensitivity: 0.2
+  });
+
+  cy.on('tap', 'node', function(evt) {
+    const node = evt.target;
+    showServiceDetail(node.data('id'));
+  });
+}
+
+async function loadTopology() {
+  const hours = document.getElementById('timeRange').value;
+  try {
+    const resp = await fetch(`${API_BASE}/api/topology?hours=${hours}`);
+    const data = await resp.json();
+    renderTopology(data);
+  } catch(e) {
+    console.error('Failed to load topology:', e);
+  }
+}
+
+async function loadHealth() {
+  const hours = document.getElementById('timeRange').value;
+  try {
+    const resp = await fetch(`${API_BASE}/api/health/overview?hours=${hours}`);
+    const data = await resp.json();
+    renderHealth(data);
+  } catch(e) {
+    console.error('Failed to load health:', e);
+  }
+}
+
+async function loadPredictions() {
+  try {
+    const resp = await fetch(`http://localhost:8087/api/predictions`);
+    const data = await resp.json();
+    renderPredictions(data);
+  } catch(e) {
+    document.getElementById('predictionList').innerHTML = '<div style="color:#94a3b8;font-size:12px;">预测服务未启动</div>';
+  }
+}
+
+function renderTopology(data) {
+  const elements = [];
+  for (const node of data.nodes || []) {
+    elements.push({ data: { id: node.id, name: node.name, status: node.status || 'unknown', ...node } });
+  }
+  for (const edge of data.edges || []) {
+    elements.push({ data: { id: edge.id, source: edge.source, target: edge.target, call_count: String(edge.call_count || '') } });
+  }
+  cy.elements().remove();
+  cy.add(elements);
+  cy.layout({
+    name: 'cose',
+    animate: true,
+    animationDuration: 500,
+    nodeOverlap: 20,
+    idealEdgeLength: 100,
+    edgeElasticity: 100
+  }).run();
+}
+
+function renderHealth(data) {
+  document.getElementById('overallStatus').textContent = data.overall_status || 'unknown';
+  document.getElementById('overallStatus').style.color = healthColor(data.overall_status);
+  document.getElementById('overallScore').textContent = data.overall_score ? data.overall_score.toFixed(0);
+  document.getElementById('serviceCount').textContent = data.service_count || 0;
+  document.getElementById('totalReq').textContent = data.total_requests || 0;
+  document.getElementById('totalErr').textContent = data.total_errors || 0;
+  document.getElementById('criticalCount').textContent = data.critical_count || 0;
+
+  const list = document.getElementById('serviceList');
+  list.innerHTML = '';
+  for (const svc of data.services || []) {
+    const cls = svc.status || 'unknown';
+    const div = document.createElement('div');
+    div.className = `service-card ${cls}`;
+    div.innerHTML = `
+      <h3>${svc.service}</h3>
+      <div class="score" style="color:${healthColor(cls)}">${svc.health_score.toFixed(0)}</div>
+      <div class="metrics">
+        请求: ${svc.request_count} | 错误率: ${(svc.error_rate * 100).toFixed(1)}% | 延迟: ${svc.avg_latency_ms.toFixed(0)}ms
+      </div>
+    `;
+    list.appendChild(div);
+  }
+}
+
+function renderPredictions(data) {
+  const list = document.getElementById('predictionList');
+  list.innerHTML = '';
+  for (const svc of data.services || []) {
+    const cls = svc.predicted_timeout ? 'risk' : (svc.confidence > 0.5 ? 'warn' : 'ok';
+    const div = document.createElement('div');
+    div.className = `prediction-card ${cls}`;
+    div.innerHTML = `
+      <h4>${svc.service}</h4>
+      <div class="prob">超时概率: ${(svc.confidence * 100).toFixed(1)}%</div>
+      <div class="details">${svc.details || ''}
+        延迟: ${svc.avg_latency_ms.toFixed(0)}ms | 错误率: ${(svc.error_rate * 100).toFixed(1)}%
+      </div>
+    `;
+    list.appendChild(div);
+  }
+}
+
+function showServiceDetail(serviceId) {
+  fetch(`${API_BASE}/api/health/${serviceId}`)
+    .then(r => r.json())
+    .then(data => {
+      alert(`${serviceId}\n状态: ${data.status}\n健康分: ${data.health_score.toFixed(0)}\n请求数: ${data.request_count}\n平均延迟: ${data.latency_ms.avg.toFixed(0)}ms\n错误率: ${(data.error_rate * 100).toFixed(2)}%`);
+    })
+    .catch(e => console.error(e));
+}
+
+function refreshData() {
+  loadTopology();
+  loadHealth();
+  loadPredictions();
+}
+
+function togglePredictions() {
+  loadPredictions();
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  initCytoscape();
+  refreshData();
+  setInterval(refreshData, 15000);
+});
+</script>
+</body>
+</html>

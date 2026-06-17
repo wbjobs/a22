@@ -52,6 +52,8 @@ func main() {
 
 	r := gin.Default()
 
+	r.Static("/web", "./web")
+
 	r.Use(func(c *gin.Context) {
 		requestID := c.GetHeader("X-Request-ID")
 		if requestID == "" {
@@ -74,6 +76,9 @@ func main() {
 		api.GET("/functions", app.listFunctions)
 		api.GET("/stats", app.getStats)
 		api.GET("/waterfall/:request_id", app.getWaterfallData)
+		api.GET("/topology", app.getServiceTopology)
+		api.GET("/health/overview", app.getHealthOverview)
+		api.GET("/health/:service", app.getServiceHealth)
 	}
 
 	r.GET("/health", app.healthCheck)
@@ -741,4 +746,471 @@ func getStatusLabel(code int) string {
 	default:
 		return "unknown"
 	}
+}
+
+type ServiceHealth struct {
+	Service        string  `json:"service"`
+	Status         string  `json:"status"`
+	HealthScore    float64 `json:"health_score"`
+	RequestCount   int64   `json:"request_count"`
+	ErrorCount     int64   `json:"error_count"`
+	ErrorRate      float64 `json:"error_rate"`
+	AvgLatencyMs   float64 `json:"avg_latency_ms"`
+	P95LatencyMs   float64 `json:"p95_latency_ms"`
+	TimeoutCount   int64   `json:"timeout_count"`
+	TimeoutRate    float64 `json:"timeout_rate"`
+	LastUpdated    string  `json:"last_updated"`
+	ChaosInjected  bool    `json:"chaos_injected"`
+	ChaosType      string  `json:"chaos_type,omitempty"`
+}
+
+func calcHealthScore(errorRate, timeoutRate, avgLatencyMs float64) (float64, string) {
+	score := 100.0
+	score -= errorRate * 500
+	score -= timeoutRate * 300
+	if avgLatencyMs > 1000 {
+		score -= 20
+	} else if avgLatencyMs > 500 {
+		score -= 10
+	}
+	if score < 0 {
+		score = 0
+	}
+	status := "healthy"
+	if score < 50 {
+		status = "critical"
+	} else if score < 75 {
+		status = "warning"
+	} else if score < 90 {
+		status = "degraded"
+	}
+	return score, status
+}
+
+func (a *App) getServiceTopology(c *gin.Context) {
+	hoursStr := c.DefaultQuery("hours", "1")
+	var hours int
+	fmt.Sscanf(hoursStr, "%d", &hours)
+	if hours <= 0 {
+		hours = 1
+	}
+
+	query := map[string]interface{}{
+		"size": 5000,
+		"query": map[string]interface{}{
+			"range": map[string]interface{}{
+				"timestamp": map[string]interface{}{
+					"gte": fmt.Sprintf("now-%dh", hours),
+				},
+			},
+		},
+		"sort": []map[string]interface{}{
+			{"timestamp": map[string]interface{}{"order": "desc"}},
+		},
+	}
+
+	spans, err := a.executeSpanQuery(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	nodes := make(map[string]map[string]interface{})
+	edges := make(map[string]map[string]interface{})
+	parentChildMap := make(map[string]map[string]bool)
+
+	for _, s := range spans {
+		svc := s.ServiceName
+		if svc == "" {
+			svc = s.FunctionName
+		}
+		if svc == "" {
+			continue
+		}
+		if _, exists := nodes[svc]; !exists {
+			nodes[svc] = map[string]interface{}{
+				"id": svc,
+				"name": svc,
+				"request_count": int64(0),
+				"error_count": int64(0),
+				"total_latency": int64(0),
+				"avg_latency": float64(0),
+			}
+		}
+		n := nodes[svc]
+		n["request_count"] = n["request_count"].(int64) + 1
+		if s.StatusCode >= 500 {
+			n["error_count"] = n["error_count"].(int64) + 1
+		}
+		n["total_latency"] = n["total_latency"].(int64) + s.DurationMs
+
+		if s.ParentSpanID != "" && s.SpanID != "" {
+			parentChildMap[s.ParentSpanID] = map[string]bool{s.SpanID: true}
+		}
+	}
+
+	for _, n := range nodes {
+		reqCount := n["request_count"].(int64)
+		if reqCount > 0 {
+			n["avg_latency"] = float64(n["total_latency"].(int64)) / float64(reqCount)
+		}
+		errCount := n["error_count"].(int64)
+		errRate := float64(0)
+		if reqCount > 0 {
+			errRate = float64(errCount) / float64(reqCount)
+		}
+		score, status := calcHealthScore(errRate, 0, n["avg_latency"].(float64))
+		n["error_rate"] = errRate
+		n["health_score"] = score
+		n["status"] = status
+		delete(n, "total_latency")
+	}
+
+	spanServiceMap := make(map[string]string)
+	for _, s := range spans {
+		svc := s.ServiceName
+		if svc == "" {
+			svc = s.FunctionName
+		}
+		spanServiceMap[s.SpanID] = svc
+	}
+
+	for parentSpanID, children := range parentChildMap {
+		parentSvc := spanServiceMap[parentSpanID]
+		if parentSvc == "" {
+			continue
+		}
+		for childSpanID := range children {
+			childSvc := spanServiceMap[childSpanID]
+			if childSvc == "" || parentSvc == childSvc {
+				continue
+			}
+			edgeKey := parentSvc + "->" + childSvc
+			if _, exists := edges[edgeKey]; !exists {
+				edges[edgeKey] = map[string]interface{}{
+					"id": edgeKey,
+					"source": parentSvc,
+					"target": childSvc,
+					"call_count": int64(0),
+				}
+			}
+			edges[edgeKey]["call_count"] = edges[edgeKey]["call_count"].(int64) + 1
+		}
+	}
+
+	nodeList := make([]map[string]interface{}, 0, len(nodes))
+	for _, n := range nodes {
+		nodeList = append(nodeList, n)
+	}
+	edgeList := make([]map[string]interface{}, 0, len(edges))
+	for _, e := range edges {
+		edgeList = append(edgeList, e)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"window_hours": hours,
+		"nodes": nodeList,
+		"edges": edgeList,
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (a *App) getHealthOverview(c *gin.Context) {
+	hoursStr := c.DefaultQuery("hours", "1")
+	var hours int
+	fmt.Sscanf(hoursStr, "%d", &hours)
+	if hours <= 0 {
+		hours = 1
+	}
+
+	query := map[string]interface{}{
+		"size": 0,
+		"query": map[string]interface{}{
+			"range": map[string]interface{}{
+				"timestamp": map[string]interface{}{
+					"gte": fmt.Sprintf("now-%dh", hours),
+				},
+			},
+		},
+		"aggs": map[string]interface{}{
+			"per_service": map[string]interface{}{
+				"terms": map[string]interface{}{
+					"field": "service_name",
+					"size": 50,
+				},
+				"aggs": map[string]interface{}{
+					"avg_dur":  map[string]interface{}{"avg": map[string]interface{}{"field": "duration_ms"}},
+					"p95_dur":  map[string]interface{}{"percentiles": map[string]interface{}{"field": "duration_ms", "percents": []int{95}}},
+					"err_5xx":  map[string]interface{}{"filter": map[string]interface{}{"range": map[string]interface{}{"status_code": map[string]interface{}{"gte": 500}}}},
+					"timeouts": map[string]interface{}{"filter": map[string]interface{}{"range": map[string]interface{}{"duration_ms": map[string]interface{}{"gte": 1000}}}},
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(query)
+	req := esapi.SearchRequest{
+		Index: []string{a.cfg.ESIndex},
+		Body:  bytes.NewReader(body),
+	}
+	resp, err := req.Do(context.Background(), a.es)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	var esResp map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&esResp)
+
+	aggs, _ := esResp["aggregations"].(map[string]interface{})
+	perSvc, _ := aggs["per_service"].(map[string]interface{})
+	buckets, _ := perSvc["buckets"].([]interface{})
+
+	services := make([]ServiceHealth, 0, len(buckets))
+	totalReq := int64(0)
+	totalErr := int64(0)
+	criticalCount := 0
+
+	for _, b := range buckets {
+		bucket, _ := b.(map[string]interface{})
+		svcName, _ := bucket["key"].(string)
+		reqCount, _ := bucket["doc_count"].(int64)
+		avgDurAgg, _ := bucket["avg_dur"].(map[string]interface{})
+		avgDur, _ := avgDurAgg["value"].(float64)
+		p95Agg, _ := bucket["p95_dur"].(map[string]interface{})
+		p95Values, _ := p95Agg["values"].(map[string]interface{})
+		var p95Dur float64
+		for _, v := range p95Values {
+			p95Dur, _ = v.(float64)
+			break
+		}
+		errAgg, _ := bucket["err_5xx"].(map[string]interface{})
+		errCount, _ := errAgg["doc_count"].(int64)
+		timeoutAgg, _ := bucket["timeouts"].(map[string]interface{})
+		timeoutCount, _ := timeoutAgg["doc_count"].(int64)
+
+		errRate := float64(0)
+		if reqCount > 0 {
+			errRate = float64(errCount) / float64(reqCount)
+		}
+		timeoutRate := float64(0)
+		if reqCount > 0 {
+			timeoutRate = float64(timeoutCount) / float64(reqCount)
+		}
+		score, status := calcHealthScore(errRate, timeoutRate, avgDur)
+		if status == "critical" {
+			criticalCount++
+		}
+
+		services = append(services, ServiceHealth{
+			Service:      svcName,
+			Status:       status,
+			HealthScore:  score,
+			RequestCount: reqCount,
+			ErrorCount:   errCount,
+			ErrorRate:    errRate,
+			AvgLatencyMs: avgDur,
+			P95LatencyMs: p95Dur,
+			TimeoutCount: timeoutCount,
+			TimeoutRate:  timeoutRate,
+			LastUpdated:  time.Now().UTC().Format(time.RFC3339),
+		})
+
+		totalReq += reqCount
+		totalErr += errCount
+	}
+
+	overallScore := float64(100)
+	overallStatus := "healthy"
+	if len(services) > 0 {
+		sumScore := float64(0)
+		for _, s := range services {
+			sumScore += s.HealthScore
+		}
+		overallScore = sumScore / float64(len(services))
+		if overallScore < 50 {
+			overallStatus = "critical"
+		} else if overallScore < 75 {
+			overallStatus = "warning"
+		} else if overallScore < 90 {
+			overallStatus = "degraded"
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"window_hours":    hours,
+		"overall_status":  overallStatus,
+		"overall_score":   overallScore,
+		"total_requests":  totalReq,
+		"total_errors":    totalErr,
+		"critical_count":  criticalCount,
+		"service_count":   len(services),
+		"services":        services,
+		"generated_at":    time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func (a *App) getServiceHealth(c *gin.Context) {
+	service := c.Param("service")
+	if service == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "service is required"})
+		return
+	}
+	hoursStr := c.DefaultQuery("hours", "1")
+	var hours int
+	fmt.Sscanf(hoursStr, "%d", &hours)
+
+	query := map[string]interface{}{
+		"size": 0,
+		"query": map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must": []map[string]interface{}{
+					{"term": map[string]interface{}{"service_name": service}},
+					{"range": map[string]interface{}{
+						"timestamp": map[string]interface{}{"gte": fmt.Sprintf("now-%dh", hours)},
+					}},
+				},
+			},
+		},
+		"aggs": map[string]interface{}{
+			"avg_dur":    map[string]interface{}{"avg": map[string]interface{}{"field": "duration_ms"}},
+			"max_dur":    map[string]interface{}{"max": map[string]interface{}{"field": "duration_ms"}},
+			"p50_dur":    map[string]interface{}{"percentiles": map[string]interface{}{"field": "duration_ms", "percents": []int{50, 95, 99}}},
+			"err_4xx":    map[string]interface{}{"filter": map[string]interface{}{"range": map[string]interface{}{"status_code": map[string]interface{}{"gte": 400, "lt": 500}}}},
+			"err_5xx":    map[string]interface{}{"filter": map[string]interface{}{"range": map[string]interface{}{"status_code": map[string]interface{}{"gte": 500}}}},
+			"timeouts":   map[string]interface{}{"filter": map[string]interface{}{"range": map[string]interface{}{"duration_ms": map[string]interface{}{"gte": 1000}}}},
+			"per_minute": map[string]interface{}{
+				"date_histogram": map[string]interface{}{
+					"field":          "timestamp",
+					"fixed_interval": "1m",
+				},
+				"aggs": map[string]interface{}{
+					"avg_dur": map[string]interface{}{"avg": map[string]interface{}{"field": "duration_ms"}},
+					"err_count": map[string]interface{}{
+						"filter": map[string]interface{}{"range": map[string]interface{}{"status_code": map[string]interface{}{"gte": 500}}},
+					},
+				},
+			},
+			"top_errors": map[string]interface{}{
+				"top_hits": map[string]interface{}{
+					"size": 10,
+					"sort": []map[string]interface{}{
+						{"timestamp": map[string]interface{}{"order": "desc"}},
+					},
+					"query": map[string]interface{}{
+						"range": map[string]interface{}{"status_code": map[string]interface{}{"gte": 500}},
+					},
+				},
+			},
+		},
+	}
+
+	body, _ := json.Marshal(query)
+	req := esapi.SearchRequest{
+		Index: []string{a.cfg.ESIndex},
+		Body:  bytes.NewReader(body),
+	}
+	resp, err := req.Do(context.Background(), a.es)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	var esResp map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&esResp)
+
+	hits, _ := esResp["hits"].(map[string]interface{})
+	totalVal, _ := hits["total"].(map[string]interface{})
+	reqCount := int64(0)
+	switch v := totalVal["value"].(type) {
+	case float64:
+		reqCount = int64(v)
+	case int64:
+		reqCount = v
+	}
+
+	if reqCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{
+			"service": service,
+			"error":   "no data found for service",
+			"status":  "unknown",
+		})
+		return
+	}
+
+	aggs, _ := esResp["aggregations"].(map[string]interface{})
+	avgDurAgg, _ := aggs["avg_dur"].(map[string]interface{})
+	avgDur, _ := avgDurAgg["value"].(float64)
+	maxDurAgg, _ := aggs["max_dur"].(map[string]interface{})
+	maxDur, _ := maxDurAgg["value"].(float64)
+	p50Agg, _ := aggs["p50_dur"].(map[string]interface{})
+	pValues, _ := p50Agg["values"].(map[string]interface{})
+	p50, p95, p99 := float64(0), float64(0), float64(0)
+	idx := 0
+	for _, v := range pValues {
+		switch idx {
+		case 0:
+			p50, _ = v.(float64)
+		case 1:
+			p95, _ = v.(float64)
+		case 2:
+			p99, _ = v.(float64)
+		}
+		idx++
+	}
+	err4xxAgg, _ := aggs["err_4xx"].(map[string]interface{})
+	err4xx, _ := err4xxAgg["doc_count"].(int64)
+	err5xxAgg, _ := aggs["err_5xx"].(map[string]interface{})
+	err5xx, _ := err5xxAgg["doc_count"].(int64)
+	timeoutAgg, _ := aggs["timeouts"].(map[string]interface{})
+	timeoutCount, _ := timeoutAgg["doc_count"].(int64)
+
+	totalErr := err4xx + err5xx
+	errRate := float64(totalErr) / float64(reqCount)
+	timeoutRate := float64(timeoutCount) / float64(reqCount)
+	score, status := calcHealthScore(errRate, timeoutRate, avgDur)
+
+	perMinAgg, _ := aggs["per_minute"].(map[string]interface{})
+	perMinBuckets, _ := perMinAgg["buckets"].([]interface{})
+	timeSeries := make([]map[string]interface{}, 0, len(perMinBuckets))
+	for _, b := range perMinBuckets {
+		bucket, _ := b.(map[string]interface{})
+		ts, _ := bucket["key_as_string"].(string)
+		count, _ := bucket["doc_count"].(int64)
+		avgB, _ := bucket["avg_dur"].(map[string]interface{})
+		avgV, _ := avgB["value"].(float64)
+		errB, _ := bucket["err_count"].(map[string]interface{})
+		errV, _ := errB["doc_count"].(int64)
+		timeSeries = append(timeSeries, map[string]interface{}{
+			"timestamp":      ts,
+			"request_count":  count,
+			"avg_latency_ms": avgV,
+			"error_count":    errV,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"service":        service,
+		"status":         status,
+		"health_score":   score,
+		"window_hours":   hours,
+		"request_count":  reqCount,
+		"error_count_4xx": err4xx,
+		"error_count_5xx": err5xx,
+		"total_errors":   totalErr,
+		"error_rate":     errRate,
+		"timeout_count":  timeoutCount,
+		"timeout_rate":   timeoutRate,
+		"latency_ms": map[string]interface{}{
+			"avg": avgDur,
+			"p50": p50,
+			"p95": p95,
+			"p99": p99,
+			"max": maxDur,
+		},
+		"time_series":    timeSeries,
+		"last_updated":   time.Now().UTC().Format(time.RFC3339),
+	})
 }

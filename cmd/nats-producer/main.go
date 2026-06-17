@@ -21,12 +21,13 @@ import (
 	"ebpf-serverless-tracing/internal/model"
 	"ebpf-serverless-tracing/internal/natsutil"
 	"ebpf-serverless-tracing/internal/sampling"
+	traceprod "ebpf-serverless-tracing/internal/traceproducer"
 	wasmmgr "ebpf-serverless-tracing/internal/wasm"
 )
 
 type App struct {
 	cfg        *config.Config
-	nats       *natsutil.NATSTraceProducer
+	nats       *traceprod.NATSTraceProducer
 	sampler    *sampling.DynamicSampler
 	wasmMgr    *wasmmgr.WasmPluginManager
 	mu         sync.Mutex
@@ -84,7 +85,7 @@ func main() {
 		RetentionHours: 168,
 	}
 
-	natsProducer, err := natsutil.NewNATSProducer(natsCfg, sampler, wasmMgr)
+	natsProducer, err := traceprod.NewNATSProducer(natsCfg, sampler, wasmMgr)
 	if err != nil {
 		log.Fatalf("[Producer] Failed to create NATS producer: %v", err)
 	}

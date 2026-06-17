@@ -10,16 +10,17 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"ebpf-serverless-tracing/internal/config"
 	"ebpf-serverless-tracing/internal/model"
 	"ebpf-serverless-tracing/internal/natsutil"
 	"ebpf-serverless-tracing/internal/sampling"
+	traceprod "ebpf-serverless-tracing/internal/traceproducer"
 	wasmmgr "ebpf-serverless-tracing/internal/wasm"
 )
 
@@ -42,7 +43,7 @@ type TracingMiddleware struct {
 	pending     map[string]*pendingSpan
 	sampler     *sampling.DynamicSampler
 	wasmMgr     *wasmmgr.WasmPluginManager
-	nats        *natsutil.NATSTraceProducer
+	nats        *traceprod.NATSTraceProducer
 	useNATS     bool
 	stats       MiddlewareStats
 }
@@ -107,7 +108,7 @@ func NewTracingMiddleware(serviceName string) *TracingMiddleware {
 			SubjectPrefix: "trace.spans",
 		}
 		var natsErr error
-		m.nats, natsErr = natsutil.NewNATSProducer(natsCfg, m.sampler, m.wasmMgr)
+		m.nats, natsErr = traceprod.NewNATSProducer(natsCfg, m.sampler, m.wasmMgr)
 		if natsErr != nil {
 			log.Printf("[Tracing:%s] Warning: NATS producer unavailable (fallback to HTTP): %v", serviceName, natsErr)
 			m.useNATS = false
@@ -355,7 +356,7 @@ type TracingRoundTripper struct {
 	ProducerURL string
 	NATSURL     string
 	useNATS     bool
-	nats        *natsutil.NATSTraceProducer
+	nats        *traceprod.NATSTraceProducer
 	sampler     *sampling.DynamicSampler
 	wasmMgr     *wasmmgr.WasmPluginManager
 	httpClient  *http.Client
@@ -403,7 +404,7 @@ func (t *TracingRoundTripper) init() {
 				SubjectPrefix: "trace.spans",
 			}
 			var err error
-			t.nats, err = natsutil.NewNATSProducer(natsCfg, t.sampler, t.wasmMgr)
+			t.nats, err = traceprod.NewNATSProducer(natsCfg, t.sampler, t.wasmMgr)
 			if err != nil {
 				log.Printf("[TracingRT:%s] Warning: NATS unavailable: %v", t.ServiceName, err)
 				t.useNATS = false

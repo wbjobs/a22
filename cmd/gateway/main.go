@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"ebpf-serverless-tracing/internal/chaos"
 	"ebpf-serverless-tracing/internal/config"
 	"ebpf-serverless-tracing/internal/model"
 )
@@ -27,7 +28,11 @@ func main() {
 	r := gin.Default()
 
 	r.Use(app.requestIDMiddleware())
+	r.Use(chaos.Middleware())
 	r.Use(app.loggingMiddleware())
+
+	admin := r.Group("/admin")
+	chaos.RegisterAdminRoutes(admin)
 
 	r.POST("/api/order", app.handleOrder)
 	r.GET("/health", app.healthCheck)

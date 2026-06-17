@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY ai-predictor/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir gunicorn
+
+COPY ai-predictor/ .
+
+ENV PYTHONUNBUFFERED=1
+ENV PREDICTOR_PORT=8087
+
+EXPOSE 8087
+
+CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8087", "--timeout", "60", "app:app"]

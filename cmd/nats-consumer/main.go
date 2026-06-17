@@ -183,7 +183,6 @@ func (a *App) flushBatch() {
 
 func (a *App) indexSpans(spans []model.TraceSpan) (int, int, error) {
 	var buf bytes.Buffer
-	var lastReqID string
 
 	for _, span := range spans {
 		meta := map[string]interface{}{
@@ -199,8 +198,6 @@ func (a *App) indexSpans(spans []model.TraceSpan) (int, int, error) {
 		spanJSON, _ := json.Marshal(span)
 		buf.Write(spanJSON)
 		buf.WriteByte('\n')
-
-		lastReqID = span.RequestID
 	}
 
 	req := esapi.BulkRequest{

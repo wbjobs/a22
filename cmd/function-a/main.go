@@ -13,6 +13,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+
+	"ebpf-serverless-tracing/internal/chaos"
 )
 
 type OrderRequest struct {
@@ -61,6 +63,10 @@ func main() {
 		log.Printf("[FunctionA:Go] request_id=%s path=%s status=%d duration=%v",
 			requestID, c.Request.URL.Path, c.Writer.Status(), duration)
 	})
+	r.Use(chaos.Middleware())
+
+	admin := r.Group("/admin")
+	chaos.RegisterAdminRoutes(admin)
 
 	r.POST("/order", handleOrder)
 	r.GET("/health", healthCheck)
@@ -83,7 +89,6 @@ func healthCheck(c *gin.Context) {
 func handleOrder(c *gin.Context) {
 	requestID := c.GetHeader("X-Request-ID")
 	traceID := c.GetHeader("X-Trace-ID")
-	parentSpanID := c.GetHeader("X-Parent-Span-ID")
 	spanID := uuid.New().String()
 	startTime := time.Now()
 
