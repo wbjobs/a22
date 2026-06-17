@@ -1,0 +1,55 @@
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    clang-14 \
+    llvm-14 \
+    libelf-dev \
+    linux-libc-dev \
+    golang-go \
+    ca-certificates \
+    git \
+    wget \
+    && ln -sf /usr/bin/clang-14 /usr/bin/clang \
+    && ln -sf /usr/bin/llc-14 /usr/bin/llc \
+    && ln -sf /usr/bin/llvm-strip-14 /usr/bin/llvm-strip \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download || true
+
+COPY . .
+
+RUN mkdir -p internal/ebpf && \
+    (command -v bpf2go >/dev/null 2>&1 || go install github.com/cilium/ebpf/cmd/bpf2go@latest) && \
+    export PATH=$PATH:$(go env GOPATH)/bin && \
+    cd cmd/ebpf-probe && \
+    go generate ./... 2>/dev/null || echo "eBPF compilation optional - will use fallback mode"
+
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /ebpf-probe ./cmd/ebpf-probe
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    tzdata \
+    iproute2 \
+    iputils-ping \
+    curl \
+    kmod \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /ebpf-probe /usr/local/bin/ebpf-probe
+
+EXPOSE 9400
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:9400/health || exit 1
+
+ENTRYPOINT ["ebpf-probe"]

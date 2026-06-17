@@ -1,34 +1,31 @@
-﻿# System
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Logs
-*.log
-logs/
-
-# Temp
-*.tmp
-*.bak
+﻿bin/
+*.o
+*.so
+*.a
+cmd/ebpf-probe/http_trace*
+cmd/ebpf-probe/bpf_*
+.vscode/
+.idea/
 *.swp
-
-# Build / Dependencies
+*.swo
+*~
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
 dist/
 build/
-out/
-venv/
-env/
-__pycache__/
-*.pyc
-
-# IDE
-.idea/
-.vscode/
-*.suo
-*.user
-*.sln.cache
-
-# Env
 .env
 .env.local
+.env.*.local
+coverage.out
+coverage.html
+go.sum.backup
+.DS_Store
+Thumbs.db
+k8s/*.local.yaml
+docker-compose.override.yml

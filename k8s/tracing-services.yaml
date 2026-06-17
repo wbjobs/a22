@@ -1,0 +1,308 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-probe
+  namespace: serverless-tracing
+  labels:
+    app: ebpf-probe
+    k8s-app: ebpf-probe
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-probe
+  template:
+    metadata:
+      labels:
+        app: ebpf-probe
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        effect: NoSchedule
+      containers:
+      - name: ebpf-probe
+        image: ebpf-serverless/ebpf-probe:latest
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - SYS_RESOURCE
+            - NET_ADMIN
+            - BPF
+            - PERFMON
+          allowPrivilegeEscalation: true
+        ports:
+        - containerPort: 9400
+          hostPort: 9400
+        env:
+        - name: EBPF_PROBE_HEALTH_PORT
+          value: "9400"
+        - name: KAFKA_BROKERS
+          value: "kafka.serverless-tracing.svc.cluster.local:9092"
+        - name: KAFKA_TOPIC
+          value: "trace-spans"
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+          readOnly: true
+        - name: proc
+          mountPath: /proc
+          readOnly: true
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: bpf-fs
+          mountPath: /sys/fs/bpf
+        - name: host-root
+          mountPath: /host
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+            host: 127.0.0.1
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+            host: 127.0.0.1
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+      volumes:
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: modules
+        hostPath:
+          path: /lib/modules
+      - name: bpf-fs
+        hostPath:
+          path: /sys/fs/bpf
+      - name: host-root
+        hostPath:
+          path: /
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-producer
+  namespace: serverless-tracing
+  labels:
+    app: kafka-producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-producer
+  template:
+    metadata:
+      labels:
+        app: kafka-producer
+    spec:
+      containers:
+      - name: kafka-producer
+        image: ebpf-serverless/kafka-producer:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8085
+        env:
+        - name: KAFKA_PRODUCER_PORT
+          value: "8085"
+        - name: KAFKA_BROKERS
+          value: "kafka.serverless-tracing.svc.cluster.local:9092"
+        - name: KAFKA_TOPIC
+          value: "trace-spans"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8085
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8085
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-producer
+  namespace: serverless-tracing
+  labels:
+    app: kafka-producer
+spec:
+  type: ClusterIP
+  selector:
+    app: kafka-producer
+  ports:
+  - name: http
+    port: 8085
+    targetPort: 8085
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-consumer
+  namespace: serverless-tracing
+  labels:
+    app: es-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: es-consumer
+  template:
+    metadata:
+      labels:
+        app: es-consumer
+    spec:
+      containers:
+      - name: es-consumer
+        image: ebpf-serverless/es-consumer:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8086
+        env:
+        - name: ES_CONSUMER_PORT
+          value: "8086"
+        - name: KAFKA_BROKERS
+          value: "kafka.serverless-tracing.svc.cluster.local:9092"
+        - name: KAFKA_TOPIC
+          value: "trace-spans"
+        - name: KAFKA_GROUP_ID
+          value: "trace-consumer-group"
+        - name: ELASTICSEARCH_URL
+          value: "http://elasticsearch.serverless-tracing.svc.cluster.local:9200"
+        - name: ES_INDEX
+          value: "trace-spans"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8086
+          initialDelaySeconds: 20
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8086
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1Gi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: query-api
+  namespace: serverless-tracing
+  labels:
+    app: query-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: query-api
+  template:
+    metadata:
+      labels:
+        app: query-api
+    spec:
+      containers:
+      - name: query-api
+        image: ebpf-serverless/query-api:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8081
+        env:
+        - name: QUERY_API_PORT
+          value: "8081"
+        - name: ELASTICSEARCH_URL
+          value: "http://elasticsearch.serverless-tracing.svc.cluster.local:9200"
+        - name: ES_INDEX
+          value: "trace-spans"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: query-api
+  namespace: serverless-tracing
+  labels:
+    app: query-api
+spec:
+  type: ClusterIP
+  selector:
+    app: query-api
+  ports:
+  - name: http
+    port: 8081
+    targetPort: 8081
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: query-api
+  namespace: serverless-tracing
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+  - host: tracing-api.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: query-api
+            port:
+              number: 8081

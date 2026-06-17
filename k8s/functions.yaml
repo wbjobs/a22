@@ -1,0 +1,192 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-a
+  namespace: serverless-tracing
+  labels:
+    app: function-a
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: function-a
+  template:
+    metadata:
+      labels:
+        app: function-a
+    spec:
+      containers:
+      - name: function-a
+        image: ebpf-serverless/function-a:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8082
+        env:
+        - name: FUNCTION_A_PORT
+          value: "8082"
+        - name: FUNCTION_B_URL
+          value: "http://function-b:8083/payment"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-a
+  namespace: serverless-tracing
+  labels:
+    app: function-a
+spec:
+  type: ClusterIP
+  selector:
+    app: function-a
+  ports:
+  - name: http
+    port: 8082
+    targetPort: 8082
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-b
+  namespace: serverless-tracing
+  labels:
+    app: function-b
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: function-b
+  template:
+    metadata:
+      labels:
+        app: function-b
+    spec:
+      containers:
+      - name: function-b
+        image: ebpf-serverless/function-b:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8083
+        env:
+        - name: FUNCTION_B_PORT
+          value: "8083"
+        - name: FUNCTION_C_URL
+          value: "http://function-c:8084/notify"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8083
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-b
+  namespace: serverless-tracing
+  labels:
+    app: function-b
+spec:
+  type: ClusterIP
+  selector:
+    app: function-b
+  ports:
+  - name: http
+    port: 8083
+    targetPort: 8083
+    protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: function-c
+  namespace: serverless-tracing
+  labels:
+    app: function-c
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: function-c
+  template:
+    metadata:
+      labels:
+        app: function-c
+    spec:
+      containers:
+      - name: function-c
+        image: ebpf-serverless/function-c:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8084
+        env:
+        - name: FUNCTION_C_PORT
+          value: "8084"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8084
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8084
+          initialDelaySeconds: 3
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: function-c
+  namespace: serverless-tracing
+  labels:
+    app: function-c
+spec:
+  type: ClusterIP
+  selector:
+    app: function-c
+  ports:
+  - name: http
+    port: 8084
+    targetPort: 8084
+    protocol: TCP
